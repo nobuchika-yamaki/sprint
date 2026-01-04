@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Supplementary Code S1
+
+MediaPipe-based sprint timing using virtual line crossing
+---------------------------------------------------------
+
+This script estimates sprint split times by detecting the moments at which
+selected anatomical landmarks cross predefined virtual lines in image space.
+
+The code is designed to operate deterministically and to return reproducible
+virtual line-crossing times, rather than to measure physical distances directly.
+"""
+
+import argparse
+import csv
+import cv2
+import numpy as np
+import mediapipe as mp
+
+# MediaPipe Pose landmark indices
+LEFT_HIP, RIGHT_HIP = 23, 24
+LEFT_ANKLE, RIGHT_ANKLE = 27, 28
+
+
+def moving_average(series, window=3):
+    """
+    Causal moving average for temporal smoothing.
+    """
+    if window <= 1:
+        return series
+
+    smoothed = []
+    buffer = []
+
+    for value in series:
+        buffer.append(value)
+        if len(buffer) > window:
+            buffer.pop(0)
+        smoothed.append(sum(buffer) / len(buffer))
+
+    return smoothed
+
+
+def interpolate_crossing(x_prev, x_curr, line_x):
+    """
+    Linear interpolation to estimate the sub-frame crossing fraction.
+    """
+    dx = x_curr - x_prev
+    if abs(dx) < 1e-9:
+        return 1.0
+
+    frac = (line_x - x_prev) / dx
+    return float(np.clip(frac, 0.0, 1.0))
+
+
+def detect_line_crossing(x_series, line_x):
+    """
+    Detect the first left-to-right crossing of a virtual vertical line.
+    """
+    for i in range(1, len(x_series)):
+        if x_series[i - 1] < line_x and x_series[i] >= line_x:
+            frac = interpolate_crossing(
+                x_series[i - 1],
+                x_series[i],
+                line_x
+            )
+            return i, frac
+    return None
+
+
+def extract_landmarks(results, width, height):
+    """
+    Extract selected landmark coordinates in pixel space.
+    """
+    if results.pose_landmarks is None:
+        return None
+
+    lm = results.pose_landmarks.landmark
+    return {
+        LEFT_ANKLE: lm[LEFT_ANKLE].x * width,
+        RIGHT_ANKLE: lm[RIGHT_ANKLE].x * width,
+        LEFT_HIP: lm[LEFT_HIP].x * width,
+        RIGHT_HIP: lm[RIGHT_HIP].x * width,
+    }
+
+
+def select_lead_ankle(label):
+    label = label.lower()
+    return LEFT_ANKLE if label in ("left", "l") else RIGHT_ANKLE
+
+
+def run_analysis(
+    video_path,
+    fps_nominal,
+    line_positions,
+    lead_ankle="left",
+    smoothing_window=3,
+    output_csv="sprint_times.csv"
+):
+    """
+    Main analysis routine.
+    """
+    cap = cv2.VideoCapture(video_path)
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = fps_nominal
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    pose = mp.solutions.pose.Pose(
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
+
+    ankle_x = []
+    hip_x = []
+
+    lead_idx = select_lead_ankle(lead_ankle)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb)
+        landmarks = extract_landmarks(results, width, height)
+
+        if landmarks is None:
+            continue
+
+        ankle_x.append(landmarks[lead_idx])
+        hip_x.append((landmarks[LEFT_HIP] + landmarks[RIGHT_HIP]) / 2)
+
+    cap.release()
+
+    ankle_x = moving_average(ankle_x, smoothing_window)
+    hip_x = moving_average(hip_x, smoothing_window)
+
+    crossings = {}
+
+    measurement_definitions = {
+        "start": (ankle_x, line_positions["start"]),
+        "5m": (hip_x, line_positions["m5"]),
+        "10m": (hip_x, line_positions["m10"]),
+        "20m": (hip_x, line_positions["m20"]),
+    }
+
+    for label, (series, line_x) in measurement_definitions.items():
+        result = detect_line_crossing(series, line_x)
+        if result is not None:
+            frame_idx, frac = result
+            crossings[label] = (frame_idx - 1 + frac) / fps
+
+    if "start" in crossings and "20m" in crossings:
+        crossings["total"] = crossings["20m"] - crossings["start"]
+
+    with open(output_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Split", "Time (s)"])
+        for key, value in crossings.items():
+            writer.writerow([key, f"{value:.3f}"])
+
+    return crossings
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--video", required=True)
+    parser.add_argument("--fps", type=float, default=60.0)
+    parser.add_argument("--start-x", type=float, required=True)
+    parser.add_argument("--m5-x", type=float, required=True)
+    parser.add_argument("--m10-x", type=float, required=True)
+    parser.add_argument("--m20-x", type=float, required=True)
+    parser.add_argument("--lead-ankle", default="left")
+    parser.add_argument("--smooth", type=int, default=3)
+    parser.add_argument("--out", default="sprint_times.csv")
+
+    args = parser.parse_args()
+
+    lines = {
+        "start": args.start_x,
+        "m5": args.m5_x,
+        "m10": args.m10_x,
+        "m20": args.m20_x,
+    }
+
+    results = run_analysis(
+        video_path=args.video,
+        fps_nominal=args.fps,
+        line_positions=lines,
+        lead_ankle=args.lead_ankle,
+        smoothing_window=args.smooth,
+        output_csv=args.out,
+    )
+
+    print("Detected splits:", results)
